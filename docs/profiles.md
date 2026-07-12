@@ -15,6 +15,11 @@ Commit a `graphify.toml` at the repository root:
 ```toml
 default_profile = "product"
 
+# optional: split packages below a shared top-level dir for the
+# cross-package-edges metric ("packages/web" vs "packages/api").
+# Top-level key: it must appear BEFORE any [table] section.
+package_roots = ["packages"]
+
 [profiles.product]
 out = "graphify-product"
 description = "first-party code only"
@@ -31,12 +36,9 @@ kind = "vendor"                 # exempt from vendor-dominance FAIL
 description = "vendored dependencies, opt-in for upstream investigations"
 
 [ownership]
-# extend the built-in generic patterns with repo-specific ones
-vendor = ["third_party/**", "extern/**", "**/node_modules/**"]
-
-# optional: split packages below a shared top-level dir for the
-# cross-package-edges metric ("packages/web" vs "packages/api")
-package_roots = ["packages"]
+# EXTENDS the built-in generic patterns (node_modules, vendor, dist, tests,
+# ...) with repo-specific ones - defaults are always preserved.
+vendor = ["third_party/**", "extern/**"]
 ```
 
 Then:

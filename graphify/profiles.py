@@ -193,9 +193,18 @@ def load_config(root: "Path | str | None" = None) -> ProjectConfig:
                     f"{CONFIG_NAME}: unknown ownership key '{key}' ignored"
                 )
                 continue
-            cfg.ownership[key] = _str_list(
-                val, ctx=f"ownership.{key}", warnings=cfg.warnings
-            )
+            # EXTENSION semantics (the documented contract): project patterns
+            # append to the built-in generic defaults, deduplicated with
+            # stable ordering (defaults first, then project order). A project
+            # list never replaces or erases the defaults - dropping
+            # **/node_modules/** because a repo added extern/** would silently
+            # reclassify dependency noise as first-party.
+            extra = _str_list(val, ctx=f"ownership.{key}", warnings=cfg.warnings)
+            merged = list(DEFAULT_OWNERSHIP[key])
+            for pat in extra:
+                if pat not in merged:
+                    merged.append(pat)
+            cfg.ownership[key] = merged
 
     cfg.package_roots = _str_list(
         data.get("package_roots"), ctx="package_roots", warnings=cfg.warnings
@@ -307,6 +316,33 @@ def classify_ownership(
             if p.startswith("**/") and fnmatch.fnmatch(path, p[3:]):
                 return bucket
     return "first_party"
+
+
+def effective_profile_excludes(root: "Path | str | None" = None) -> list[str]:
+    """Exclude patterns of the ACTIVE profile, for scan-time application.
+
+    The single source of truth for profile-driven corpus exclusion - the
+    extract command and every update/watch/hook rebuild path apply THIS set
+    through detect's anchored ``extra_excludes`` channel, so there is exactly
+    one exclusion mechanism.
+
+    Active profile: ``GRAPHIFY_PROFILE`` env when it names a known profile,
+    else ``default_profile``. Returns [] (legacy-identical, fail-open) when
+    ``GRAPHIFY_OUT`` overrides output resolution (a profile that lost output
+    resolution must not silently filter the scan), when no graphify.toml
+    exists, or on any load problem.
+    """
+    try:
+        if os.environ.get("GRAPHIFY_OUT", "").strip():
+            return []
+        cfg = load_config(root)
+        if cfg.source_path is None:
+            return []
+        name = os.environ.get("GRAPHIFY_PROFILE", "").strip() or cfg.default_profile
+        prof = cfg.profile(name) if name else None
+        return list(prof.exclude) if prof is not None else []
+    except Exception:
+        return []
 
 
 def emit_warnings(cfg: ProjectConfig, *, stream=None) -> None:

@@ -251,3 +251,116 @@ def test_env_profile_typo_warns_on_resolve(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GRAPHIFY_PROFILE", "tyop")
     assert resolve_out_dir(root=tmp_path) == "graphify-out"
     assert "GRAPHIFY_PROFILE" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Ownership EXTENSION semantics (review P2 #2): project [ownership] patterns
+# append to the built-in defaults - they never replace or erase them.
+# --------------------------------------------------------------------------- #
+def test_ownership_extends_preserves_vendor_defaults(tmp_path):
+    _write_toml(tmp_path, '[ownership]\nvendor = ["extern/**"]\n')
+    cfg = load_config(tmp_path)
+    for kept in ("**/node_modules/**", "**/vendor/**", "**/site-packages/**"):
+        assert kept in cfg.ownership["vendor"], kept
+    assert "extern/**" in cfg.ownership["vendor"]
+    # project pattern appended after defaults (stable ordering)
+    assert cfg.ownership["vendor"].index("extern/**") > cfg.ownership["vendor"].index("**/vendor/**")
+
+
+def test_ownership_extends_generated_and_test_defaults(tmp_path):
+    _write_toml(tmp_path, (
+        '[ownership]\n'
+        'generated = ["gen/**"]\n'
+        'test = ["qa/**"]\n'
+    ))
+    cfg = load_config(tmp_path)
+    assert "**/dist/**" in cfg.ownership["generated"] and "gen/**" in cfg.ownership["generated"]
+    assert "**/tests/**" in cfg.ownership["test"] and "qa/**" in cfg.ownership["test"]
+
+
+def test_ownership_duplicates_appear_once(tmp_path):
+    _write_toml(tmp_path, '[ownership]\nvendor = ["**/vendor/**", "extern/**", "extern/**"]\n')
+    cfg = load_config(tmp_path)
+    assert cfg.ownership["vendor"].count("**/vendor/**") == 1
+    assert cfg.ownership["vendor"].count("extern/**") == 1
+
+
+def test_ownership_empty_project_list_keeps_defaults(tmp_path):
+    _write_toml(tmp_path, '[ownership]\nvendor = []\n')
+    cfg = load_config(tmp_path)
+    assert cfg.ownership["vendor"] == DEFAULT_OWNERSHIP["vendor"]
+
+
+def test_ownership_no_leak_between_configs(tmp_path):
+    baseline = list(DEFAULT_OWNERSHIP["vendor"])
+    a = tmp_path / "a"; a.mkdir()
+    b = tmp_path / "b"; b.mkdir()
+    (a / "graphify.toml").write_text('[ownership]\nvendor = ["aa/**"]\n', encoding="utf-8")
+    (b / "graphify.toml").write_text('[ownership]\nvendor = ["bb/**"]\n', encoding="utf-8")
+    cfg_a = load_config(a)
+    cfg_b = load_config(b)
+    assert "aa/**" in cfg_a.ownership["vendor"] and "bb/**" not in cfg_a.ownership["vendor"]
+    assert "bb/**" in cfg_b.ownership["vendor"] and "aa/**" not in cfg_b.ownership["vendor"]
+    # module-level defaults never mutated
+    assert DEFAULT_OWNERSHIP["vendor"] == baseline
+    assert "aa/**" not in DEFAULT_OWNERSHIP["vendor"]
+
+
+def test_ownership_unknown_key_warning_retained(tmp_path):
+    _write_toml(tmp_path, '[ownership]\nfuture_bucket = ["x/"]\nvendor = ["extern/**"]\n')
+    cfg = load_config(tmp_path)
+    assert any("future_bucket" in w for w in cfg.warnings)
+    assert "extern/**" in cfg.ownership["vendor"]
+
+
+def test_classify_uses_merged_patterns(tmp_path):
+    _write_toml(tmp_path, '[ownership]\nvendor = ["extern/**"]\n')
+    cfg = load_config(tmp_path)
+    assert classify_ownership("extern/lib/a.js", cfg.ownership) == "vendor"       # custom
+    assert classify_ownership("web/node_modules/x/i.js", cfg.ownership) == "vendor"  # default kept
+    assert classify_ownership("src/app.py", cfg.ownership) == "first_party"
+
+
+# --------------------------------------------------------------------------- #
+# Documented quick-start config (review P2 #3): the example in docs/profiles.md
+# must parse with package_roots as TOP-LEVEL configuration (not swallowed by
+# the [ownership] table) and produce no unknown-key warnings.
+# --------------------------------------------------------------------------- #
+def _docs_quickstart_toml():
+    import re as _re
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "profiles.md").read_text(
+        encoding="utf-8")
+    m = _re.search(r"```toml\n(.*?)```", doc, _re.DOTALL)
+    assert m, "docs/profiles.md quick-start toml block not found"
+    return m.group(1)
+
+
+def test_docs_quickstart_parses_with_toplevel_package_roots(tmp_path):
+    (tmp_path / "graphify.toml").write_text(_docs_quickstart_toml(), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.package_roots == ["packages"], cfg.package_roots
+    assert cfg.warnings == [], cfg.warnings          # no unknown ownership-key warning
+    assert cfg.default_profile == "product"
+    assert set(cfg.profiles) >= {"product", "vendor"}
+    assert "package_roots" not in cfg.ownership      # never ownership.package_roots
+
+
+def test_docs_quickstart_package_roots_drive_cross_package_metric(tmp_path):
+    import json as _json
+    from graphify.fitness import compute_fitness
+    (tmp_path / "graphify.toml").write_text(_docs_quickstart_toml(), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    gp = tmp_path / "graph.json"
+    gp.write_text(_json.dumps({
+        "directed": True,
+        "nodes": [
+            {"id": "a", "source_file": "packages/web/a.ts", "community": 0},
+            {"id": "b", "source_file": "packages/api/b.ts", "community": 0},
+        ],
+        "links": [{"source": "a", "target": "b"}],
+    }), encoding="utf-8")
+    m = compute_fitness(gp, config=cfg).metrics
+    # without package_roots both nodes share the "packages" top-level segment
+    # (0 cross edges); the documented config splits them.
+    assert m["cross_package_edges"] == 1

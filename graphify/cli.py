@@ -2158,30 +2158,22 @@ def dispatch_command(cmd: str) -> None:
             print("error: must specify a path to scan or a --postgres DSN", file=sys.stderr)
             sys.exit(1)
 
-        # Active profile (GRAPHIFY_PROFILE env or graphify.toml default_profile)
-        # contributes its exclude patterns through the same anchored
-        # extra_excludes channel as --exclude flags (#947 semantics: appended
-        # last, wins over ignore files). Skipped entirely when GRAPHIFY_OUT is
-        # set: the env var outranks every profile tier in the precedence
-        # chain, so a profile that lost output resolution must not silently
-        # filter the scan either. include patterns are not yet wired into the
-        # scan - documented v1 limitation in docs/profiles.md.
+        # Active-profile exclude patterns ride the same anchored extra_excludes
+        # channel as --exclude flags (#947: appended last, wins over ignore
+        # files). effective_profile_excludes is the SINGLE source of truth -
+        # the update/watch/hook rebuild paths apply the identical set, so no
+        # build path can reintroduce excluded files. It returns [] when
+        # GRAPHIFY_OUT overrides output resolution, when no graphify.toml
+        # exists, or on any load problem (legacy-identical). include patterns
+        # are not yet wired into the scan - documented v1 limitation.
         try:
-            if not os.environ.get("GRAPHIFY_OUT", "").strip():
-                from graphify.profiles import load_config as _load_profiles_config
+            from graphify.profiles import effective_profile_excludes
 
-                _pcfg = _load_profiles_config(None)
-                _env_pname = os.environ.get("GRAPHIFY_PROFILE", "").strip()
-                _pname = _env_pname or _pcfg.default_profile
-                _pactive = _pcfg.profile(_pname) if _pname else None
-                if _env_pname and _pactive is None:
-                    print(f"[graphify] warning: GRAPHIFY_PROFILE='{_env_pname}' "
-                          "names no profile in graphify.toml; building with "
-                          "legacy defaults", file=sys.stderr)
-                if _pactive is not None and _pactive.exclude:
-                    cli_excludes.extend(_pactive.exclude)
-                    print(f"[graphify extract] profile '{_pactive.name}': "
-                          f"{len(_pactive.exclude)} exclude pattern(s) applied")
+            _prof_excludes = effective_profile_excludes()
+            if _prof_excludes:
+                cli_excludes.extend(_prof_excludes)
+                print(f"[graphify extract] profile excludes active: "
+                      f"{len(_prof_excludes)} pattern(s)")
         except Exception:
             pass
 
