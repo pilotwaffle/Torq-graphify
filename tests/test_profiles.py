@@ -400,3 +400,36 @@ def test_config_root_for_file_input_uses_parent(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("pass\n", encoding="utf-8")
     assert config_root_for(f) == tmp_path.resolve()
+
+
+# --------------------------------------------------------------------------- #
+# Synthesized profile outputs are validated (fresh-review P2): TOML quoted
+# table names can contain slashes/dots, so 'graphify-' + name must pass the
+# same boundary checks as explicit out values.
+# --------------------------------------------------------------------------- #
+def test_synthesized_out_from_traversal_profile_name_sanitized(tmp_path):
+    _write_toml(tmp_path, (
+        'default_profile = "a/../../outside"\n'
+        '[profiles."a/../../outside"]\n'
+        'description = "no out key on purpose"\n'
+    ))
+    cfg = load_config(tmp_path)
+    prof = cfg.profiles["a/../../outside"]
+    assert "/" not in prof.out, prof.out
+    from pathlib import PurePosixPath
+    assert ".." not in PurePosixPath(prof.out).parts
+    assert prof.out.startswith("graphify-")
+    assert any("safe path" in w for w in cfg.warnings)
+    # resolution stays inside the repo boundary
+    assert resolve_out_dir(root=tmp_path) == prof.out
+
+
+def test_explicit_bad_out_fallback_is_also_sanitized(tmp_path):
+    _write_toml(tmp_path, (
+        '[profiles."weird/name"]\n'
+        'out = "/abs/escape"\n'
+    ))
+    cfg = load_config(tmp_path)
+    prof = cfg.profiles["weird/name"]
+    assert "/" not in prof.out and prof.out.startswith("graphify-")
+    assert any("relative path" in w for w in cfg.warnings)

@@ -1613,3 +1613,79 @@ def test_rebuild_subdir_target_finds_repo_root_config(tmp_path, monkeypatch):
     # configs meant for subtree scans must use scan-root-relative patterns.
     # What we pin here: the repo-root config WAS discovered (no crash, no
     # cwd fallback) - discovery is the fresh-review contract under test.
+
+
+# --------------------------------------------------------------------------- #
+# Output dirs are pruned by EXACT PATH, not basename (fresh-review P1): a
+# profile out like "graphs/app" must never shadow real source dirs named
+# "app", and only the actual output location is excluded from the scan.
+# --------------------------------------------------------------------------- #
+def test_profile_out_basename_does_not_shadow_source_dirs(tmp_path, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphs/app"\n',
+        encoding="utf-8",
+    )
+    # Real source dir named "app" - the output's BASENAME.
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text("def app_entry():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.py").write_text("def x():\n    return 2\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild(tmp_path)
+    gp = tmp_path / "graphs" / "app" / "graph.json"
+    # update writes scan-root-relative via the import-time constant; under
+    # pytest that constant is the default, so read whichever graph exists.
+    if not gp.is_file():
+        gp = tmp_path / "graphify-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("app/main.py" in s for s in sources), sources  # NOT shadowed
+    assert any("src/x.py" in s for s in sources)
+
+
+def test_exact_output_dir_not_reingested_but_samename_source_survives(tmp_path, monkeypatch):
+    # Custom output dir: the exact root-level output dir is never
+    # re-ingested, while a nested SOURCE dir with the same basename is.
+    # (Patch the import-time module bindings, matching the harness
+    # convention - env vars cannot retroactively change them.)
+    monkeypatch.setenv("GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.paths.GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.detect.GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.watch._GRAPHIFY_OUT", "build-out")
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src" / "build-out").mkdir(parents=True)
+    (tmp_path / "src" / "build-out" / "code.py").write_text(
+        "def nested_samename():\n    return 1\n", encoding="utf-8")
+    _run_rebuild(tmp_path)   # first build creates build-out/
+    _run_rebuild(tmp_path)   # second build must not ingest build-out/ itself
+    gp = tmp_path / "build-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("src/build-out/code.py" in s for s in sources), sources
+    assert not any(s.startswith("build-out/") for s in sources), sources
+
+
+def test_sibling_profile_out_dirs_pruned_exactly(tmp_path, monkeypatch):
+    # Building one profile must not ingest another profile's output dir.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphify-product"\n'
+        '[profiles.vendor]\nout = "graphify-vendor"\nkind = "vendor"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.py").write_text("def x():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "graphify-vendor").mkdir()
+    (tmp_path / "graphify-vendor" / "leftover.py").write_text(
+        "def stale_vendor_artifact():\n    return 9\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("src/x.py" in s for s in sources)
+    assert not any("graphify-vendor" in s for s in sources), sources

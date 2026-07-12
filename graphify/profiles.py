@@ -125,26 +125,51 @@ def _norm(value: Any) -> str:
     return str(value).replace("\\", "/").strip()
 
 
+def _out_is_unsafe(out: str) -> bool:
+    """A normalized output path escapes the repository boundary."""
+    return (
+        not out
+        or out.startswith("/")
+        or re.match(r"^[A-Za-z]:", out) is not None
+        or ".." in PurePosixPath(out).parts
+    )
+
+
+def _safe_slug(name: str) -> str:
+    """Reduce an arbitrary profile name to a single safe path segment."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+    return slug or "profile"
+
+
 def _safe_out(name: str, raw: Any, warnings: list[str]) -> str:
     """Validate a profile's output dir: must stay a relative path inside the
     repository. graphify.toml is REPO-AUTHOR-controlled (a different trust
     boundary from the user-set GRAPHIFY_OUT env var, which legitimately allows
     absolute shared paths), so absolute paths, drive letters, and ``..``
-    traversal are rejected with a warning and the safe default is used."""
+    traversal are rejected with a warning and the safe default is used.
+
+    The synthesized fallback goes through the SAME validation: TOML quoted
+    table names may contain slashes and dots ([profiles."a/../../outside"]),
+    so 'graphify-' + name is not inherently safe - an unsafe synthesis is
+    reduced to a sanitized single-segment slug instead.
+    """
     if not raw:
-        return f"graphify-{name}"
+        candidate = _norm(f"graphify-{name}")
+        if _out_is_unsafe(candidate):
+            slug = _safe_slug(name)
+            warnings.append(
+                f"{CONFIG_NAME}: profile name {name!r} is not a safe path "
+                f"segment; using 'graphify-{slug}'"
+            )
+            return f"graphify-{slug}"
+        return candidate
     out = _norm(raw)
-    if (
-        not out
-        or out.startswith("/")
-        or re.match(r"^[A-Za-z]:", out)
-        or ".." in PurePosixPath(out).parts
-    ):
+    if _out_is_unsafe(out):
         warnings.append(
             f"{CONFIG_NAME}: profiles.{name}.out {raw!r} must be a relative "
-            f"path inside the repository; using 'graphify-{name}'"
+            f"path inside the repository; using 'graphify-{_safe_slug(name)}'"
         )
-        return f"graphify-{name}"
+        return f"graphify-{_safe_slug(name)}"
     return out
 
 
