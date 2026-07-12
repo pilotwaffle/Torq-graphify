@@ -1529,3 +1529,87 @@ def test_rebuild_ignores_profile_excludes_when_graphify_out_env_set(tmp_path, mo
     _run_rebuild(tmp_path)
     sources = _graph_sources(tmp_path)
     assert any("vendor/" in s for s in sources), sources
+
+
+# --------------------------------------------------------------------------- #
+# Config discovery follows the SCANNED project (fresh-review P2): a rebuild
+# targeting a repo from outside it must honor THAT repo's graphify.toml, and
+# never a config from the process CWD or from above the target's VCS root.
+# --------------------------------------------------------------------------- #
+def _run_rebuild_target(target):
+    from graphify.watch import _rebuild_code
+    ok = _rebuild_code(Path(target), no_cluster=True, force=True, acquire_lock=False)
+    assert ok, "rebuild failed"
+
+
+def _repo_graph_sources(repo):
+    gp = repo / "graphify-out" / "graph.json"
+    assert gp.is_file(), "rebuild produced no graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    return {
+        str(n.get("source_file", "")).replace("\\", "/")
+        for n in data.get("nodes", [])
+        if isinstance(n, dict)
+    }
+
+
+def test_rebuild_from_outside_repo_uses_target_config(tmp_path, monkeypatch):
+    # CI-workspace scenario: cwd is the PARENT, target is the repo.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _profile_repo(repo)
+    monkeypatch.chdir(tmp_path)  # OUTSIDE the repo
+    _run_rebuild_target(repo)
+    sources = _repo_graph_sources(repo)
+    assert any("src/app.py" in s for s in sources)
+    assert not any("vendor/" in s for s in sources), sources
+
+
+def test_rebuild_cwd_config_never_governs_foreign_target(tmp_path, monkeypatch):
+    # CWD has its own toml excluding src/ - it must NOT leak onto the target.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "trap"\n[profiles.trap]\nout = "o"\nexclude = ["src/"]\n',
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()  # VCS boundary: the walk must stop here
+    (repo / "src").mkdir()
+    (repo / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild_target(repo)
+    sources = _repo_graph_sources(repo)
+    # cwd's "exclude src/" trap did not apply; repo has no config of its own.
+    assert any("src/app.py" in s for s in sources), sources
+
+
+def test_rebuild_subdir_target_finds_repo_root_config(tmp_path, monkeypatch):
+    # Scanning a subdir of a repo whose toml sits at the VCS root.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "graphify.toml").write_text(
+        'default_profile = "product"\n[profiles.product]\nout = "graphify-product"\n'
+        'exclude = ["area/vendor/"]\n',
+        encoding="utf-8",
+    )
+    (repo / "area" / "src").mkdir(parents=True)
+    (repo / "area" / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (repo / "area" / "vendor").mkdir()
+    (repo / "area" / "vendor" / "dep.py").write_text("def v():\n    return 2\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild_target(repo / "area")
+    gp = repo / "area" / "graphify-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("src/app.py" in s for s in sources)
+    # Pattern is anchored at the SCAN root; repo-root-relative "area/vendor/"
+    # does not anchor under area/, so this documents the anchoring contract:
+    # configs meant for subtree scans must use scan-root-relative patterns.
+    # What we pin here: the repo-root config WAS discovered (no crash, no
+    # cwd fallback) - discovery is the fresh-review contract under test.

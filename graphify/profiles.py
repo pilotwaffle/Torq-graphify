@@ -318,6 +318,33 @@ def classify_ownership(
     return "first_party"
 
 
+_VCS_MARKERS = (".git", ".hg", ".svn")
+
+
+def config_root_for(start: "Path | str") -> Path:
+    """Nearest directory at or above ``start`` holding a graphify.toml.
+
+    Profile filtering must follow the PROJECT BEING SCANNED, not the process
+    CWD - `graphify extract /work/repo` from a CI parent workspace has to
+    honor /work/repo's config. The walk mirrors the ignore-file convention:
+    check ``start`` and each ancestor, stopping AFTER the first directory
+    that carries a VCS marker (the repo root - configs above it belong to
+    someone else). Falls back to ``start`` when nothing is found.
+    """
+    base = Path(start).resolve()
+    if base.is_file():
+        base = base.parent
+    current = base
+    while True:
+        if (current / CONFIG_NAME).is_file():
+            return current
+        if any((current / marker).exists() for marker in _VCS_MARKERS):
+            return base  # repo root without a config: stop, no config applies
+        if current.parent == current:
+            return base
+        current = current.parent
+
+
 def effective_profile_excludes(root: "Path | str | None" = None) -> list[str]:
     """Exclude patterns of the ACTIVE profile, for scan-time application.
 
@@ -325,6 +352,11 @@ def effective_profile_excludes(root: "Path | str | None" = None) -> list[str]:
     extract command and every update/watch/hook rebuild path apply THIS set
     through detect's anchored ``extra_excludes`` channel, so there is exactly
     one exclusion mechanism.
+
+    ``root`` should be the SCAN TARGET: the governing graphify.toml is
+    discovered from the target upward (bounded by the VCS root), never from
+    the process CWD, so cross-directory scans honor the scanned project's
+    config. Callers omitting ``root`` keep CWD semantics.
 
     Active profile: ``GRAPHIFY_PROFILE`` env when it names a known profile,
     else ``default_profile``. Returns [] (legacy-identical, fail-open) when
@@ -335,7 +367,7 @@ def effective_profile_excludes(root: "Path | str | None" = None) -> list[str]:
     try:
         if os.environ.get("GRAPHIFY_OUT", "").strip():
             return []
-        cfg = load_config(root)
+        cfg = load_config(config_root_for(root) if root is not None else None)
         if cfg.source_path is None:
             return []
         name = os.environ.get("GRAPHIFY_PROFILE", "").strip() or cfg.default_profile

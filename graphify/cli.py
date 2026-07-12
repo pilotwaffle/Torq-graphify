@@ -2169,7 +2169,7 @@ def dispatch_command(cmd: str) -> None:
         try:
             from graphify.profiles import effective_profile_excludes
 
-            _prof_excludes = effective_profile_excludes()
+            _prof_excludes = effective_profile_excludes(target)
             if _prof_excludes:
                 cli_excludes.extend(_prof_excludes)
                 print(f"[graphify extract] profile excludes active: "

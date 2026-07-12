@@ -799,7 +799,7 @@ def _rebuild_code(
         # result, so filtered files are skipped AND their stale nodes evicted.
         from graphify.profiles import effective_profile_excludes
 
-        _prof_excludes = effective_profile_excludes()
+        _prof_excludes = effective_profile_excludes(watch_root)
         if _prof_excludes:
             print(f"[graphify watch] profile excludes active: {len(_prof_excludes)} pattern(s)")
         detected = detect(

@@ -364,3 +364,39 @@ def test_docs_quickstart_package_roots_drive_cross_package_metric(tmp_path):
     # without package_roots both nodes share the "packages" top-level segment
     # (0 cross edges); the documented config splits them.
     assert m["cross_package_edges"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# config_root_for: config discovery walks up from the scan target, bounded by
+# the VCS root (fresh-review P2 - scanned project governs, never process CWD).
+# --------------------------------------------------------------------------- #
+def test_config_root_for_target_itself(tmp_path):
+    from graphify.profiles import config_root_for
+    _write_toml(tmp_path, '[profiles.app]\nout = "o"\n')
+    assert config_root_for(tmp_path) == tmp_path.resolve()
+
+
+def test_config_root_for_walks_to_ancestor(tmp_path):
+    from graphify.profiles import config_root_for
+    _write_toml(tmp_path, '[profiles.app]\nout = "o"\n')
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    assert config_root_for(sub) == tmp_path.resolve()
+
+
+def test_config_root_for_stops_at_vcs_root(tmp_path):
+    from graphify.profiles import config_root_for
+    _write_toml(tmp_path, '[profiles.trap]\nout = "o"\n')  # ABOVE the repo
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    # repo has a VCS marker but no config: the walk stops there and the
+    # parent's config is never picked up.
+    assert config_root_for(repo) == repo.resolve()
+
+
+def test_config_root_for_file_input_uses_parent(tmp_path):
+    from graphify.profiles import config_root_for
+    _write_toml(tmp_path, '[profiles.app]\nout = "o"\n')
+    f = tmp_path / "x.py"
+    f.write_text("pass\n", encoding="utf-8")
+    assert config_root_for(f) == tmp_path.resolve()
