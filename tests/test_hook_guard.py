@@ -23,6 +23,11 @@ from graphify import __main__ as m
 def _invoke(kind, payload, tmp_path, monkeypatch, *, graph=True, out_name="graphify-out"):
     monkeypatch.setattr("graphify.paths.GRAPHIFY_OUT", out_name)
     monkeypatch.setattr("graphify.paths.GRAPHIFY_OUT_NAME", out_name)
+    # The guard resolves the output dir dynamically (env/profile aware), so the
+    # harness pins the env too — hermetic against the ambient shell and against
+    # any graphify.toml default_profile leaking in from a parent dir.
+    monkeypatch.setenv("GRAPHIFY_OUT", out_name)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
     monkeypatch.chdir(tmp_path)
     if graph:
         (tmp_path / out_name).mkdir(parents=True, exist_ok=True)
@@ -179,6 +184,43 @@ def test_read_nudges_source_outside_custom_output_dir(tmp_path, monkeypatch):
     assert "graphify query" in out
 
 
+def test_nudge_names_resolved_path_not_hardcoded_default(tmp_path, monkeypatch):
+    # Capability: the nudge must display the ACTUAL resolved graph path, never
+    # a hardcoded 'graphify-out/graph.json', so agents query the right graph.
+    out = _invoke("search", {"tool_input": {"command": "grep x"}},
+                  tmp_path, monkeypatch, graph=True, out_name="graphify-product")
+    assert "graphify-product/graph.json" in out
+    assert "graphify-out/graph.json" not in out
+
+
+def test_nudge_resolves_profile_from_toml_without_env(tmp_path, monkeypatch):
+    # No env var at all: a graphify.toml default_profile alone must steer the
+    # guard to the profile's output dir.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "main"\n\n[profiles.main]\nout = "graphify-main"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "graphify-main").mkdir()
+    (tmp_path / "graphify-main" / "graph.json").write_text("{}", encoding="utf-8")
+
+    import io as _io
+    import sys as _sys
+    data = json.dumps({"tool_input": {"command": "grep x"}}).encode("utf-8")
+
+    class _Stdin:
+        def __init__(self, b):
+            self.buffer = _io.BytesIO(b)
+
+    monkeypatch.setattr(_sys, "stdin", _Stdin(data))
+    buf = _io.StringIO()
+    monkeypatch.setattr(_sys, "stdout", buf)
+    m._run_hook_guard("search")
+    assert "graphify-main/graph.json" in buf.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # fail-open: malformed / empty stdin never crashes or blocks
 # --------------------------------------------------------------------------- #
@@ -191,12 +233,25 @@ def test_fail_open_on_bad_stdin(kind, raw, tmp_path, monkeypatch):
 
 def test_search_out_path_error_is_swallowed(tmp_path, monkeypatch):
     # If the graph-existence check itself throws, the guard stays silent (never
-    # blocks the tool).
-    def _boom(*a, **k):
+    # blocks the tool). The existence check now runs against the dynamically
+    # resolved dir, so the throw is injected at Path.is_file.
+    import pathlib
+
+    def _boom(self):
         raise OSError("boom")
-    monkeypatch.setattr("graphify.paths.out_path", _boom)
+    monkeypatch.setattr(pathlib.Path, "is_file", _boom)
     out = _invoke("search", {"tool_input": {"command": "grep x"}}, tmp_path, monkeypatch)
     assert out.strip() == ""
+
+
+def test_search_resolver_error_falls_back_to_default(tmp_path, monkeypatch):
+    # A failure in profile/env RESOLUTION (as opposed to the existence check)
+    # degrades to the legacy default dir rather than disabling the guard.
+    def _boom(*a, **k):
+        raise RuntimeError("resolver boom")
+    monkeypatch.setattr("graphify.paths.resolve_out_dir", _boom)
+    out = _invoke("search", {"tool_input": {"command": "grep x"}}, tmp_path, monkeypatch)
+    assert "graphify-out/graph.json" in out and "graphify query" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -216,9 +271,11 @@ def test_gemini_allow_without_graph(tmp_path, monkeypatch):
 
 
 def test_gemini_always_allows_even_when_check_throws(tmp_path, monkeypatch):
-    def _boom(*a, **k):
+    import pathlib
+
+    def _boom(self):
         raise OSError("boom")
-    monkeypatch.setattr("graphify.paths.out_path", _boom)
+    monkeypatch.setattr(pathlib.Path, "is_file", _boom)
     out = _invoke("gemini", None, tmp_path, monkeypatch, graph=True)
     assert json.loads(out) == {"decision": "allow"}
 
