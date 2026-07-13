@@ -14,7 +14,7 @@ from graphify.google_workspace import (
     convert_google_workspace_file,
     google_workspace_enabled,
 )
-from graphify.paths import GRAPHIFY_OUT, GRAPHIFY_OUT_NAME, out_path
+from graphify.paths import GRAPHIFY_OUT, out_path
 
 
 class FileType(str, Enum):
@@ -693,7 +693,12 @@ _SKIP_DIRS = {
     "site-packages", "lib64",
     ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".eggs", "*.egg-info",
-    "graphify-out", GRAPHIFY_OUT_NAME,  # never treat own output as source input (#524); honour GRAPHIFY_OUT (#1423)
+    # Never treat own output as source input (#524). Only the LITERAL default
+    # lives here: custom output dirs (GRAPHIFY_OUT env #1423, graphify.toml
+    # profile outs) are pruned by EXACT PATH in the scan walk below - matching
+    # by bare basename let a profile out like "app" or "graphs/app" shadow
+    # every real source dir named "app" and silently drop application code.
+    "graphify-out",
     # Coverage/test-artefact dirs — generated, never architecturally meaningful
     "coverage", "lcov-report",              # Vitest/Istanbul/nyc HTML reports (#870)
     "visual-tests", "visual-test",          # Playwright/visual-regression bundles (#869)
@@ -720,6 +725,47 @@ _SKIP_FILES = {
 # silently dropped legitimate source from the graph (#1666). "__snapshots__" stays
 # unconditionally pruned above; only the ambiguous bare name is gated here.
 _JS_SNAPSHOT_TEST_ROOTS = frozenset({"__tests__", "__test__"})
+
+
+def _resolve_or_none(path: Path) -> "Path | None":
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _output_dir_paths(root: Path) -> "tuple[set[str], set[Path]]":
+    """Exact output-dir paths to prune for a scan rooted at ``root``.
+
+    Covers the active output dir (GRAPHIFY_OUT env / profile / legacy) plus
+    every profile ``out`` declared by the governing graphify.toml - graph
+    outputs are never source input (#524, #1423). Matching is by EXACT
+    resolved path, never by basename: a profile output named like a source
+    dir ("app", "graphs/app") must not shadow real code. Returns
+    (basenames, resolved paths) so the walk can pre-filter cheaply by name.
+    Fail-open: any resolution problem simply prunes less (ignore files and
+    the literal "graphify-out" skip still apply).
+    """
+    paths: set[Path] = set()
+
+    def _add(base: Path, value: str) -> None:
+        p = Path(value)
+        resolved = _resolve_or_none(p if p.is_absolute() else base / p)
+        if resolved is not None:
+            paths.add(resolved)
+
+    try:
+        _add(root, GRAPHIFY_OUT)
+        from graphify.profiles import config_root_for, load_config
+
+        croot = config_root_for(root)
+        cfg = load_config(croot)
+        for prof in cfg.profiles.values():
+            if prof.out:
+                _add(croot, prof.out)
+    except Exception:
+        pass
+    return {p.name for p in paths}, paths
 
 
 def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
@@ -1089,6 +1135,10 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
 
     skipped_sensitive: list[str] = []
     unclassified: list[str] = []
+    # Exact output-dir paths to prune this scan (active out + every profile
+    # out from the governing graphify.toml). Basename pre-filter keeps the
+    # per-directory cost to a set lookup; resolve() runs only on name hits.
+    _out_names, _out_paths = _output_dir_paths(root)
     ignore_patterns = _load_graphifyignore(root)
     ignore_cache: dict[Path, bool] = {}  # shared across all _is_ignored calls in this scan
     # CLI --exclude patterns are anchored at the scan root and appended last
@@ -1155,6 +1205,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                 dirnames[:] = [
                     d for d in dirnames
                     if not _is_noise_dir(d, dp)
+                    and not (d in _out_names and _resolve_or_none(dp / d) in _out_paths)
                     and not _is_ignored(dp / d, root, ignore_patterns, _cache=ignore_cache)
                 ]
                 if follow_symlinks:

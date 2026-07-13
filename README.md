@@ -410,6 +410,28 @@ dist/
 
 ---
 
+## Graph profiles (monorepos, vendored code)
+
+One graph rarely fits a monorepo: a large vendored tree can leave >90% of
+nodes describing code you don't own, and the failure is silent. Commit a
+`graphify.toml` defining named profiles — e.g. a first-party `product` graph
+(default) and an opt-in `vendor` graph, each with its own output directory —
+then gate trust with the fitness command:
+
+```bash
+graphify profiles           # list profiles defined in graphify.toml
+graphify fitness            # nodes, ownership shares, cross-package edges,
+                            # label coverage -> PASS / LOW / FAIL (exit 1)
+graphify fitness --strict   # LOW also exits 1, for CI gating
+```
+
+Select the build profile with `GRAPHIFY_PROFILE=<name>` or the
+`default_profile` key. Vendor-dominated builds print a one-line advisory the
+moment they happen. Full schema, resolution precedence, and v1 limitations:
+[docs/profiles.md](docs/profiles.md).
+
+---
+
 ## Team setup
 
 `graphify-out/` is meant to be committed to git so everyone on the team starts with a map.

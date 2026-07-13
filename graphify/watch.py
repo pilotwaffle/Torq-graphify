@@ -791,7 +791,22 @@ def _rebuild_code(
         from graphify.export import to_json, to_html
         from graphify.security import check_graph_file_size_cap
 
-        detected = detect(watch_path, follow_symlinks=follow_symlinks)
+        # Profile excludes apply to EVERY rebuild path (update CLI, watcher,
+        # git hooks) through this single detect call - the same normalized set
+        # the extract command uses (profiles.effective_profile_excludes), so a
+        # rebuild can never reintroduce files the profile build excluded. The
+        # incremental changed_paths flow below intersects with this detect
+        # result, so filtered files are skipped AND their stale nodes evicted.
+        from graphify.profiles import effective_profile_excludes
+
+        _prof_excludes = effective_profile_excludes(watch_root)
+        if _prof_excludes:
+            print(f"[graphify watch] profile excludes active: {len(_prof_excludes)} pattern(s)")
+        detected = detect(
+            watch_path,
+            follow_symlinks=follow_symlinks,
+            extra_excludes=_prof_excludes or None,
+        )
         code_files = [Path(f) for f in detected['files']['code']]
 
         # Include document files that have AST extractors (e.g. .md, .mdx, .qmd)

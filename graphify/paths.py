@@ -20,7 +20,45 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
+def _import_time_default() -> str:
+    """Resolve the output dir once at import.
+
+    Precedence: ``GRAPHIFY_OUT`` env (existing contract) > ``GRAPHIFY_PROFILE``
+    env naming a graphify.toml profile > graphify.toml ``default_profile`` >
+    legacy ``"graphify-out"``. The profile tiers are guarded so that ANY
+    problem (no toml, unparseable toml, unknown profile, tomllib missing on
+    3.10) degrades to the legacy literal - a repo without graphify.toml sees
+    byte-identical behavior to before profiles existed.
+    """
+    env_out = os.environ.get("GRAPHIFY_OUT", "").strip()
+    if env_out:
+        return env_out
+    try:
+        from graphify.profiles import load_config
+
+        cfg = load_config(Path(os.getcwd()))
+        env_name = os.environ.get("GRAPHIFY_PROFILE", "").strip()
+        name = env_name or cfg.default_profile
+        if name:
+            prof = cfg.profile(name)
+            if prof is not None and prof.out:
+                return prof.out
+            if env_name:
+                # A typo'd env profile silently building into the legacy dir is
+                # the wrong-directory failure profiles exist to prevent - warn.
+                import sys
+
+                print(
+                    f"[graphify] warning: GRAPHIFY_PROFILE={env_name!r} names "
+                    "no profile in graphify.toml; using legacy 'graphify-out'",
+                    file=sys.stderr,
+                )
+    except Exception:
+        pass
+    return "graphify-out"
+
+
+GRAPHIFY_OUT = _import_time_default()
 
 # Directory segments that, when they appear as a whole path component, mark the
 # whole path as a test location. Matched against path *segments* (not raw
@@ -232,3 +270,51 @@ def default_graph_json() -> str:
     the path is passed explicitly (#1423).
     """
     return str(out_path("graph.json"))
+
+
+def resolve_out_dir(
+    *,
+    out: "str | None" = None,
+    profile: "str | None" = None,
+    root: "Path | str | None" = None,
+) -> str:
+    """Resolve the output dir dynamically (fresh env + config read per call).
+
+    Precedence: explicit ``out`` > explicit ``profile`` (raises ProfileError
+    on a typo - an explicit request must never silently fall back) >
+    ``GRAPHIFY_OUT`` env > ``GRAPHIFY_PROFILE`` env > graphify.toml
+    ``default_profile`` > legacy ``"graphify-out"``.
+
+    Unlike the import-time ``GRAPHIFY_OUT`` constant (kept for back-compat and
+    the documented set-env-before-start flow), this reads the environment and
+    ``graphify.toml`` at call time, so hook-guard invocations and long-lived
+    processes resolve against current state.
+    """
+    if out:
+        return out
+    from graphify.profiles import load_config, resolve_profile
+
+    if profile:
+        return resolve_profile(profile, root).out
+    env_out = os.environ.get("GRAPHIFY_OUT", "").strip()
+    if env_out:
+        return env_out
+    try:
+        cfg = load_config(root)
+        env_name = os.environ.get("GRAPHIFY_PROFILE", "").strip()
+        name = env_name or cfg.default_profile
+        if name:
+            prof = cfg.profile(name)
+            if prof is not None and prof.out:
+                return prof.out
+            if env_name:
+                import sys
+
+                print(
+                    f"[graphify] warning: GRAPHIFY_PROFILE={env_name!r} names "
+                    "no profile in graphify.toml; using legacy 'graphify-out'",
+                    file=sys.stderr,
+                )
+    except Exception:
+        pass
+    return "graphify-out"

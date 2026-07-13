@@ -13,30 +13,44 @@ from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from pathlib import Path
 
 
-_SEARCH_NUDGE = json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "additionalContext": (
-            'MANDATORY: graphify-out/graph.json exists. You MUST run '
-            '`graphify query "<question>"` before grepping raw files. Only grep '
-            'after graphify has oriented you, or to modify/debug specific lines.'
-        ),
-    }
-}, ensure_ascii=False, separators=(",", ":")) + "\n"
-_READ_NUDGE = json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "additionalContext": (
-            'MANDATORY: graphify-out/graph.json exists. You MUST run graphify '
-            'before reading source files. Use: `graphify query "<question>"` '
-            '(scoped subgraph), `graphify explain "<concept>"`, or '
-            '`graphify path "<A>" "<B>"`. Only read raw files after graphify has '
-            'oriented you, or to modify/debug specific lines. This rule applies to '
-            'subagents too — include it in every subagent prompt involving code '
-            'exploration.'
-        ),
-    }
-}, ensure_ascii=False, separators=(",", ":")) + "\n"
+def _search_nudge(graph_path: str) -> str:
+    """Search-guard nudge naming the RESOLVED graph path (profiles-aware)."""
+    return json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": (
+                f'MANDATORY: {graph_path} exists. You MUST run '
+                '`graphify query "<question>"` before grepping raw files. Only grep '
+                'after graphify has oriented you, or to modify/debug specific lines.'
+            ),
+        }
+    }, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _read_nudge(graph_path: str) -> str:
+    """Read-guard nudge naming the RESOLVED graph path (profiles-aware)."""
+    return json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": (
+                f'MANDATORY: {graph_path} exists. You MUST run graphify '
+                'before reading source files. Use: `graphify query "<question>"` '
+                '(scoped subgraph), `graphify explain "<concept>"`, or '
+                '`graphify path "<A>" "<B>"`. Only read raw files after graphify has '
+                'oriented you, or to modify/debug specific lines. This rule applies to '
+                'subagents too — include it in every subagent prompt involving code '
+                'exploration.'
+            ),
+        }
+    }, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+# Kept as module-level STRINGS (built against the generic default path): the
+# install-surface contract (__main__ re-export, test_install_strings.py) reads
+# these as text. Runtime hook-guard invocations build fresh nudges against the
+# per-call resolved path via the builders above.
+_SEARCH_NUDGE = _search_nudge("graphify-out/graph.json")
+_READ_NUDGE = _read_nudge("graphify-out/graph.json")
 _HOOK_SOURCE_EXTS = (
     '.py', '.js', '.ts', '.tsx', '.jsx', '.astro', '.vue', '.svelte', '.go',
     '.rs', '.java', '.rb', '.c', '.h', '.cpp', '.hpp', '.cc', '.cs', '.kt',
@@ -103,15 +117,29 @@ def _run_hook_guard(kind: str) -> None:
     non-matching tool call, prints nothing and the caller exits 0, so a legitimate
     tool call is never blocked. Detection mirrors the previous hooks exactly.
     """
-    from graphify.paths import out_path, GRAPHIFY_OUT_NAME
+    from graphify.paths import resolve_out_dir
+    # Resolve the output dir per invocation (env, GRAPHIFY_PROFILE, or the
+    # project's graphify.toml default_profile) so the nudges name the ACTUAL
+    # graph being recommended, never a hardcoded "graphify-out/graph.json".
+    # Any resolution problem degrades to the legacy default - fail open.
+    try:
+        _out_dir = str(resolve_out_dir())
+    except Exception:
+        _out_dir = "graphify-out"
+    _graph_file = Path(_out_dir) / "graph.json"
+    _display = _out_dir.replace("\\", "/").rstrip("/") + "/graph.json"
+    _out_name = os.path.basename(os.path.normpath(_out_dir)).lower()
     # Gemini's BeforeTool hook takes no stdin and must ALWAYS return a decision so
     # the tool is never blocked; the graph nudge is appended only when a graph
     # exists. Handled before the stdin read below (which the search/read guards need).
     if kind == "gemini":
         payload = {"decision": "allow"}
         try:
-            if out_path("graph.json").is_file():
-                payload["additionalContext"] = _GEMINI_NUDGE_TEXT
+            if _graph_file.is_file():
+                payload["additionalContext"] = _GEMINI_NUDGE_TEXT.replace(
+                    "graphify-out/",
+                    _out_dir.replace("\\", "/").rstrip("/") + "/",
+                )
         except Exception:
             pass
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -131,8 +159,8 @@ def _run_hook_guard(kind: str) -> None:
             # Same set the old `case` matched: *grep*, *ripgrep*, and rg/find/fd/
             # ack/ag as a token (name followed by a space).
             if any(tok in cmd_str for tok in ("grep", "ripgrep", "rg ", "find ", "fd ", "ack ", "ag ")) \
-                    and out_path("graph.json").is_file():
-                sys.stdout.write(_SEARCH_NUDGE)
+                    and _graph_file.is_file():
+                sys.stdout.write(_search_nudge(_display))
         elif kind == "read":
             vals = [str(t.get("file_path") or ""), str(t.get("pattern") or ""), str(t.get("path") or "")]
             j = " ".join(vals).lower().replace("\\", "/")
@@ -142,10 +170,10 @@ def _run_hook_guard(kind: str) -> None:
                 for seg in [v.lower().replace("\\", "/").rsplit("/", 1)[-1]]
                 if "." in seg
             ]
-            under_out = "graphify-out/" in j or (GRAPHIFY_OUT_NAME.lower() + "/") in j
+            under_out = "graphify-out/" in j or (_out_name + "/") in j
             if not under_out and any(tl in _HOOK_SOURCE_EXTS for tl in tails) \
-                    and out_path("graph.json").is_file():
-                sys.stdout.write(_READ_NUDGE)
+                    and _graph_file.is_file():
+                sys.stdout.write(_read_nudge(_display))
     except Exception:
         pass
 def _clone_repo(
@@ -908,6 +936,92 @@ def dispatch_command(cmd: str) -> None:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    elif cmd == "fitness":
+        # graphify fitness [--profile P | --graph PATH] [--json] [--strict]
+        # Health metrics + PASS/LOW/FAIL verdict for a built graph. FAIL (or
+        # LOW under --strict) exits 1 so CI and agent policies can gate on it.
+        from graphify.fitness import (
+            VERDICT_FAIL, VERDICT_LOW, active_profile_name, compute_fitness, format_report,
+        )
+        from graphify.paths import resolve_out_dir
+        from graphify.profiles import ProfileError, emit_warnings, load_config, resolve_profile
+
+        as_json = "--json" in sys.argv
+        strict = "--strict" in sys.argv
+        args = [a for a in sys.argv[2:] if a not in ("--json", "--strict")]
+        graph_override: str | None = None
+        profile_name = ""
+        i_arg = 0
+        while i_arg < len(args):
+            a = args[i_arg]
+            if a == "--graph" and i_arg + 1 < len(args):
+                graph_override = args[i_arg + 1]; i_arg += 2
+            elif a.startswith("--graph="):
+                graph_override = a.split("=", 1)[1]; i_arg += 1
+            elif a == "--profile" and i_arg + 1 < len(args):
+                profile_name = args[i_arg + 1]; i_arg += 2
+            elif a.startswith("--profile="):
+                profile_name = a.split("=", 1)[1]; i_arg += 1
+            else:
+                print(f"error: unknown fitness argument: {a}", file=sys.stderr)
+                sys.exit(2)
+        cfg = load_config(None)
+        emit_warnings(cfg)
+        try:
+            if profile_name:
+                # Validate even when --graph short-circuits path resolution:
+                # an explicit profile typo must hard-error (exit 2), never
+                # silently grade against default thresholds.
+                resolve_profile(profile_name, config=cfg)
+            graph_path = graph_override or str(
+                Path(resolve_out_dir(profile=profile_name or None)) / "graph.json"
+            )
+        except ProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        # Grade with the SAME profile that governs path resolution: explicit
+        # --profile, else GRAPHIFY_PROFILE env, else default_profile - so an
+        # env-selected kind=vendor profile keeps its dominance exemption.
+        report = compute_fitness(
+            graph_path, config=cfg,
+            profile_name=profile_name or active_profile_name(cfg),
+        )
+        if as_json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(format_report(report))
+        if report.verdict == VERDICT_FAIL or (strict and report.verdict == VERDICT_LOW):
+            sys.exit(1)
+
+    elif cmd == "profiles":
+        # graphify profiles — list the graph profiles defined in graphify.toml.
+        from graphify.paths import resolve_out_dir
+        from graphify.profiles import emit_warnings, load_config
+
+        cfg = load_config(None)
+        emit_warnings(cfg)
+        if not cfg.profiles:
+            src = f" ({cfg.source_path})" if cfg.source_path else ""
+            print(f"No graph profiles defined{src}. Add [profiles.<name>] tables "
+                  "to graphify.toml (see docs/profiles.md).")
+        else:
+            active = ""
+            try:
+                active = resolve_out_dir()
+            except Exception:
+                pass
+            for name in sorted(cfg.profiles):
+                prof = cfg.profiles[name]
+                marks = []
+                if name == cfg.default_profile:
+                    marks.append("default")
+                if prof.kind:
+                    marks.append(f"kind={prof.kind}")
+                if active and prof.out == active:
+                    marks.append("active")
+                suffix = f"  [{', '.join(marks)}]" if marks else ""
+                print(f"  {name:<16} -> {prof.out}{suffix}")
+
     elif cmd == "watch":
         watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
         if not watch_path.exists():
@@ -1226,6 +1340,11 @@ def dispatch_command(cmd: str) -> None:
                 print(f"Skipped graph.html: {viz_err}")
                 stages.mark("export"); stages.total()
                 print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
+
+        # Post-build advisory: surface vendor dominance the moment it happens
+        # instead of letting a noise-dominated graph silently pass as healthy.
+        from graphify.fitness import maybe_warn_vendor_dominance
+        maybe_warn_vendor_dominance(out / "graph.json")
 
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
@@ -2038,6 +2157,25 @@ def dispatch_command(cmd: str) -> None:
         if not has_path and cli_postgres_dsn is None:
             print("error: must specify a path to scan or a --postgres DSN", file=sys.stderr)
             sys.exit(1)
+
+        # Active-profile exclude patterns ride the same anchored extra_excludes
+        # channel as --exclude flags (#947: appended last, wins over ignore
+        # files). effective_profile_excludes is the SINGLE source of truth -
+        # the update/watch/hook rebuild paths apply the identical set, so no
+        # build path can reintroduce excluded files. It returns [] when
+        # GRAPHIFY_OUT overrides output resolution, when no graphify.toml
+        # exists, or on any load problem (legacy-identical). include patterns
+        # are not yet wired into the scan - documented v1 limitation.
+        try:
+            from graphify.profiles import effective_profile_excludes
+
+            _prof_excludes = effective_profile_excludes(target)
+            if _prof_excludes:
+                cli_excludes.extend(_prof_excludes)
+                print(f"[graphify extract] profile excludes active: "
+                      f"{len(_prof_excludes)} pattern(s)")
+        except Exception:
+            pass
 
         _VALID_MODES = {"deep"}
         if extract_mode is not None and extract_mode not in _VALID_MODES:

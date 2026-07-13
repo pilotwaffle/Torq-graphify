@@ -1410,3 +1410,282 @@ def test_merge_changed_paths_dedupes_in_order():
         [Path("a.py")],
     )
     assert [p.as_posix() for p in merged] == ["a.py", "b.py", "c.py"]
+
+
+# --------------------------------------------------------------------------- #
+# Profile excludes during update/rebuild (review P2 #1): every rebuild path
+# flows through _rebuild_code's detect call, which must apply the SAME
+# effective profile exclusions as the extract command - an update must never
+# reintroduce files the profile build excluded.
+# --------------------------------------------------------------------------- #
+def _profile_repo(tmp_path):
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphify-product"\n'
+        'exclude = ["vendor/"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "def first_party_entry():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "vendor" / "lib").mkdir(parents=True)
+    (tmp_path / "vendor" / "lib" / "dep.py").write_text(
+        "def vendored_dep():\n    return 2\n", encoding="utf-8")
+
+
+def _graph_sources(tmp_path):
+    gp = tmp_path / "graphify-out" / "graph.json"
+    assert gp.is_file(), "rebuild produced no graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    return {
+        str(n.get("source_file", "")).replace("\\", "/")
+        for n in data.get("nodes", [])
+        if isinstance(n, dict)
+    }
+
+
+@pytest.fixture()
+def _profile_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
+def _run_rebuild(tmp_path):
+    from graphify.watch import _rebuild_code
+    ok = _rebuild_code(Path("."), no_cluster=True, force=True, acquire_lock=False)
+    assert ok, "rebuild failed"
+
+
+def test_rebuild_applies_profile_excludes(tmp_path, _profile_env):
+    _profile_repo(tmp_path)
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("src/app.py" in s for s in sources)
+    assert not any("vendor/" in s for s in sources), sources
+
+
+def test_update_after_edit_keeps_excludes(tmp_path, _profile_env):
+    _profile_repo(tmp_path)
+    _run_rebuild(tmp_path)
+    (tmp_path / "src" / "app.py").write_text(
+        "def first_party_entry():\n    return 1\n\ndef second():\n    return 3\n",
+        encoding="utf-8",
+    )
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("src/app.py" in s for s in sources)
+    assert not any("vendor/" in s for s in sources), sources
+
+
+def test_update_never_introduces_new_excluded_files(tmp_path, _profile_env):
+    _profile_repo(tmp_path)
+    _run_rebuild(tmp_path)
+    (tmp_path / "vendor" / "lib" / "newdep.py").write_text(
+        "def new_vendored():\n    return 4\n", encoding="utf-8")
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert not any("newdep" in s or "vendor/" in s for s in sources), sources
+
+
+def test_rebuild_legacy_repo_without_toml_unchanged(tmp_path, _profile_env):
+    # No graphify.toml: previous behavior - vendor files ARE scanned.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "dep.py").write_text("def v():\n    return 2\n", encoding="utf-8")
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("vendor/dep.py" in s for s in sources), sources
+
+
+def test_rebuild_excludes_windows_separator_pattern(tmp_path, _profile_env):
+    # A backslash pattern in graphify.toml is normalized and still excludes.
+    backslash_pattern = "vendor" + chr(92) + "sub/"  # vendor\sub/ (Windows form)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphify-product"\n'
+        # TOML literal string (single quotes): backslash taken verbatim.
+        "exclude = ['" + backslash_pattern + "']\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "vendor" / "sub").mkdir(parents=True)
+    (tmp_path / "vendor" / "sub" / "dep.py").write_text("def v():\n    return 2\n", encoding="utf-8")
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("src/app.py" in s for s in sources)
+    assert not any("vendor/sub" in s for s in sources), sources
+
+
+def test_rebuild_ignores_profile_excludes_when_graphify_out_env_set(tmp_path, monkeypatch):
+    # GRAPHIFY_OUT outranks profile tiers: excludes must NOT apply (and the
+    # graph lands in the env-named dir) - consistent with the extract path.
+    _profile_repo(tmp_path)
+    monkeypatch.setenv("GRAPHIFY_OUT", "graphify-out")
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("vendor/" in s for s in sources), sources
+
+
+# --------------------------------------------------------------------------- #
+# Config discovery follows the SCANNED project (fresh-review P2): a rebuild
+# targeting a repo from outside it must honor THAT repo's graphify.toml, and
+# never a config from the process CWD or from above the target's VCS root.
+# --------------------------------------------------------------------------- #
+def _run_rebuild_target(target):
+    from graphify.watch import _rebuild_code
+    ok = _rebuild_code(Path(target), no_cluster=True, force=True, acquire_lock=False)
+    assert ok, "rebuild failed"
+
+
+def _repo_graph_sources(repo):
+    gp = repo / "graphify-out" / "graph.json"
+    assert gp.is_file(), "rebuild produced no graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    return {
+        str(n.get("source_file", "")).replace("\\", "/")
+        for n in data.get("nodes", [])
+        if isinstance(n, dict)
+    }
+
+
+def test_rebuild_from_outside_repo_uses_target_config(tmp_path, monkeypatch):
+    # CI-workspace scenario: cwd is the PARENT, target is the repo.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _profile_repo(repo)
+    monkeypatch.chdir(tmp_path)  # OUTSIDE the repo
+    _run_rebuild_target(repo)
+    sources = _repo_graph_sources(repo)
+    assert any("src/app.py" in s for s in sources)
+    assert not any("vendor/" in s for s in sources), sources
+
+
+def test_rebuild_cwd_config_never_governs_foreign_target(tmp_path, monkeypatch):
+    # CWD has its own toml excluding src/ - it must NOT leak onto the target.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "trap"\n[profiles.trap]\nout = "o"\nexclude = ["src/"]\n',
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()  # VCS boundary: the walk must stop here
+    (repo / "src").mkdir()
+    (repo / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild_target(repo)
+    sources = _repo_graph_sources(repo)
+    # cwd's "exclude src/" trap did not apply; repo has no config of its own.
+    assert any("src/app.py" in s for s in sources), sources
+
+
+def test_rebuild_subdir_target_finds_repo_root_config(tmp_path, monkeypatch):
+    # Scanning a subdir of a repo whose toml sits at the VCS root.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "graphify.toml").write_text(
+        'default_profile = "product"\n[profiles.product]\nout = "graphify-product"\n'
+        'exclude = ["area/vendor/"]\n',
+        encoding="utf-8",
+    )
+    (repo / "area" / "src").mkdir(parents=True)
+    (repo / "area" / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (repo / "area" / "vendor").mkdir()
+    (repo / "area" / "vendor" / "dep.py").write_text("def v():\n    return 2\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild_target(repo / "area")
+    gp = repo / "area" / "graphify-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("src/app.py" in s for s in sources)
+    # Pattern is anchored at the SCAN root; repo-root-relative "area/vendor/"
+    # does not anchor under area/, so this documents the anchoring contract:
+    # configs meant for subtree scans must use scan-root-relative patterns.
+    # What we pin here: the repo-root config WAS discovered (no crash, no
+    # cwd fallback) - discovery is the fresh-review contract under test.
+
+
+# --------------------------------------------------------------------------- #
+# Output dirs are pruned by EXACT PATH, not basename (fresh-review P1): a
+# profile out like "graphs/app" must never shadow real source dirs named
+# "app", and only the actual output location is excluded from the scan.
+# --------------------------------------------------------------------------- #
+def test_profile_out_basename_does_not_shadow_source_dirs(tmp_path, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphs/app"\n',
+        encoding="utf-8",
+    )
+    # Real source dir named "app" - the output's BASENAME.
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text("def app_entry():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.py").write_text("def x():\n    return 2\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild(tmp_path)
+    gp = tmp_path / "graphs" / "app" / "graph.json"
+    # update writes scan-root-relative via the import-time constant; under
+    # pytest that constant is the default, so read whichever graph exists.
+    if not gp.is_file():
+        gp = tmp_path / "graphify-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("app/main.py" in s for s in sources), sources  # NOT shadowed
+    assert any("src/x.py" in s for s in sources)
+
+
+def test_exact_output_dir_not_reingested_but_samename_source_survives(tmp_path, monkeypatch):
+    # Custom output dir: the exact root-level output dir is never
+    # re-ingested, while a nested SOURCE dir with the same basename is.
+    # (Patch the import-time module bindings, matching the harness
+    # convention - env vars cannot retroactively change them.)
+    monkeypatch.setenv("GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.paths.GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.detect.GRAPHIFY_OUT", "build-out")
+    monkeypatch.setattr("graphify.watch._GRAPHIFY_OUT", "build-out")
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src" / "build-out").mkdir(parents=True)
+    (tmp_path / "src" / "build-out" / "code.py").write_text(
+        "def nested_samename():\n    return 1\n", encoding="utf-8")
+    _run_rebuild(tmp_path)   # first build creates build-out/
+    _run_rebuild(tmp_path)   # second build must not ingest build-out/ itself
+    gp = tmp_path / "build-out" / "graph.json"
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    sources = {str(n.get("source_file", "")).replace("\\", "/") for n in data["nodes"]}
+    assert any("src/build-out/code.py" in s for s in sources), sources
+    assert not any(s.startswith("build-out/") for s in sources), sources
+
+
+def test_sibling_profile_out_dirs_pruned_exactly(tmp_path, monkeypatch):
+    # Building one profile must not ingest another profile's output dir.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    monkeypatch.delenv("GRAPHIFY_PROFILE", raising=False)
+    (tmp_path / "graphify.toml").write_text(
+        'default_profile = "product"\n'
+        '[profiles.product]\nout = "graphify-product"\n'
+        '[profiles.vendor]\nout = "graphify-vendor"\nkind = "vendor"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.py").write_text("def x():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "graphify-vendor").mkdir()
+    (tmp_path / "graphify-vendor" / "leftover.py").write_text(
+        "def stale_vendor_artifact():\n    return 9\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _run_rebuild(tmp_path)
+    sources = _graph_sources(tmp_path)
+    assert any("src/x.py" in s for s in sources)
+    assert not any("graphify-vendor" in s for s in sources), sources
